@@ -39,6 +39,9 @@ use deno_core::ResourceId;
 use deno_tls::create_client_config;
 use deno_tls::load_certs;
 use deno_tls::load_private_keys;
+use deno_tls::rustls::server::ResolvesServerCertUsingSni;
+use deno_tls::rustls::sign::CertifiedKey;
+use deno_tls::rustls::sign::RsaSigningKey;
 use deno_tls::rustls::Certificate;
 use deno_tls::rustls::ClientConfig;
 use deno_tls::rustls::ClientConnection;
@@ -47,9 +50,6 @@ use deno_tls::rustls::PrivateKey;
 use deno_tls::rustls::ServerConfig;
 use deno_tls::rustls::ServerConnection;
 use deno_tls::rustls::ServerName;
-use deno_tls::rustls::server::ResolvesServerCertUsingSni;
-use deno_tls::rustls::sign::CertifiedKey;
-use deno_tls::rustls::sign::RsaSigningKey;
 use io::Error;
 use io::Read;
 use io::Write;
@@ -991,8 +991,7 @@ impl Resource for TlsListenerResource {
   }
 }
 
-#[derive(Deserialize)]
-#[derive(Clone)]
+#[derive(Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct SniInfo {
   sni: String,
@@ -1015,17 +1014,20 @@ pub struct ListenTlsArgs {
 }
 
 fn build_resolver(
-  sni_info: &[SniInfo]
-) -> Result<ResolvesServerCertUsingSni, AnyError>
-{
+  sni_info: &[SniInfo],
+) -> Result<ResolvesServerCertUsingSni, AnyError> {
   let mut resolver = ResolvesServerCertUsingSni::new();
 
   for elem in sni_info.iter() {
-    let certs: Vec<Certificate> = load_certs(&mut BufReader::new(elem.cert.as_bytes()))?;
+    let certs: Vec<Certificate> =
+      load_certs(&mut BufReader::new(elem.cert.as_bytes()))?;
     let key = load_private_keys(elem.key.as_bytes())?.remove(0);
     let signing_key = RsaSigningKey::new(&key)?;
 
-    resolver.add(elem.sni.as_str(), CertifiedKey::new(certs, Arc::new(signing_key)))?;
+    resolver.add(
+      elem.sni.as_str(),
+      CertifiedKey::new(certs, Arc::new(signing_key)),
+    )?;
   }
 
   Ok(resolver)
@@ -1069,52 +1071,60 @@ where
 
   if let Some(vec) = sni_info {
     if cert_file.is_some() || key_file.is_some() {
-      return Err(generic_error("If `sniInfo` is specified, `cert` and `key` cannot be specified, too."));
+      return Err(generic_error(
+        "If `sniInfo` is specified, `cert` and `key` cannot be specified, too.",
+      ));
     } else if cert.is_some() || key.is_some() {
       return Err(generic_error("If `sniInfo` is specified, `certFile` and `keyFile` cannot be specified, too."));
     }
 
-    tls_config = tls_config_builder
-    .with_cert_resolver(Arc::new(build_resolver(vec)?));
+    tls_config =
+      tls_config_builder.with_cert_resolver(Arc::new(build_resolver(vec)?));
   } else {
     let cert_chain;
     let key_der;
 
     // TODO: re-rust this - like it was before
     if cert_file.is_some() {
-      if !key_file.is_some() {
-        return Err(generic_error("If `certFile` is specified, `keyFile` needs to be specified, too."));
+      if key_file.is_none() {
+        return Err(generic_error(
+          "If `certFile` is specified, `keyFile` needs to be specified, too.",
+        ));
       } else if cert.is_some() || key.is_some() {
         return Err(generic_error("If `certFile` and `keyFile` are specified, `cert` and `key` cannot be specified, too."));
       } else if sni_info.is_some() {
         return Err(generic_error("If `certFile` and `keyFile` are specified, `sniInfo` cannot be specified, too."));
       }
-      
-      cert_chain = load_certs_from_file(cert_file.clone().unwrap())?;
-      key_der = load_private_keys_from_file(key_file.clone().unwrap())?.remove(0);
+
+      cert_chain = load_certs_from_file(cert_file.unwrap())?;
+      key_der =
+        load_private_keys_from_file(key_file.unwrap())?.remove(0);
     } else if cert.is_some() {
-      if !key.is_some() {
-        return Err(generic_error("If `cert` is specified, `key` needs to be specified, too."));
+      if key.is_none() {
+        return Err(generic_error(
+          "If `cert` is specified, `key` needs to be specified, too.",
+        ));
       } else if cert_file.is_some() || key_file.is_some() {
         return Err(generic_error("If `cert` and `key` are specified, `certFile` and `keyFile` cannot be specified, too."));
       } else if sni_info.is_some() {
         return Err(generic_error("If `cert` and `key` are specified, `sniInfo` cannot be specified, too."));
       }
-      
-      cert_chain = load_certs(&mut BufReader::new(cert.clone().unwrap().as_bytes()))?;
-      key_der = load_private_keys(key.clone().unwrap().as_bytes())?.remove(0);
+
+      cert_chain =
+        load_certs(&mut BufReader::new(cert.unwrap().as_bytes()))?;
+      key_der = load_private_keys(key.unwrap().as_bytes())?.remove(0);
     } else {
       return Err(generic_error("Specify either `cert` with `key` or `certFile` with `keyFile` or `sniInfo`."));
     };
 
     tls_config = tls_config_builder
-    .with_single_cert(cert_chain, key_der)
-    .map_err(|e| {
-      custom_error(
-        "InvalidData",
-        format!("Error creating TLS certificate: {:?}", e),
-      )
-    })?;
+      .with_single_cert(cert_chain, key_der)
+      .map_err(|e| {
+        custom_error(
+          "InvalidData",
+          format!("Error creating TLS certificate: {:?}", e),
+        )
+      })?;
   }
 
   if let Some(alpn_protocols) = args.alpn_protocols {
@@ -1176,20 +1186,21 @@ pub fn op_tls_add_sni_info(
     .ok_or_else(|| custom_error("Busy", "sni_info busy"))?; // TODO: msg...???
 
   // tls_config was initialized with a single certificate - to make addSniInfo always work,
-  // tls_config has to always be initialized with a cert resolver, which (might) (slightly) reduce 
+  // tls_config has to always be initialized with a cert resolver, which (might) (slightly) reduce
   // performance and (might) (slightly) increase memory usage
   // Prevent adding sniInfo if tls_config was not initialized with sniInfo / a cert resolver
   if sni_info_ref.is_empty() {
     return Err(generic_error("Unable to call `addSniInfo` if the listener was not initialized with `sniInfo`"));
   }
 
-  sni_info_ref.push(SniInfo { sni: sni, cert: cert, key: key });
+  sni_info_ref.push(SniInfo { sni, cert, key, });
 
   let mut tls_config_ref = RcRef::map(&resource, |r| &r.tls_config)
     .try_borrow_mut() // TODO: await?
     .ok_or_else(|| custom_error("Busy", "tls_config busy"))?; // TODO: msg...???
-  
-  tls_config_ref.cert_resolver = Arc::new(build_resolver(&sni_info_ref).unwrap());
+
+  tls_config_ref.cert_resolver =
+    Arc::new(build_resolver(&sni_info_ref).unwrap());
 
   Ok(())
 }
