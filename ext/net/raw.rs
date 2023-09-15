@@ -282,7 +282,7 @@ pub fn take_network_stream_listener_resource(
 
     return Ok(NetworkStreamListener::Tls(
       resource.tcp_listener.into_inner(),
-      Arc::new(resource.tls_config.into_inner().clone()),
+      Arc::new(resource.tls_config.into_inner().unwrap().clone()),
     ));
   }
 

@@ -50,6 +50,7 @@ use trust_dns_resolver::AsyncResolver;
 #[serde(rename_all = "camelCase")]
 pub struct TlsHandshakeInfo {
   pub alpn_protocol: Option<ByteString>,
+  pub server_name: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]

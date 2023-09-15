@@ -164,7 +164,7 @@ async fn op_http_upgrade(
       conn_rid: state
         .borrow_mut()
         .resource_table
-        .add(TlsStreamResource::new(tls_stream.into_split())),
+        .add(TlsStreamResource::new(tls_stream.into_split(), Option::None)),
       read_buf: read_buf.to_vec().into(),
     }),
     Err(_) => Err(custom_error(

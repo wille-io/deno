@@ -57,7 +57,7 @@ declare namespace Deno {
   export interface TlsListener extends Listener, AsyncIterable<TlsConn> {
     /** Waits for a TLS client to connect and accepts the connection. */
     accept(): Promise<TlsConn>;
-    addSniInfo(sniInfo: SniInfo): void;
+    resolveCertificate?(name: string): Promise<{ cert: string; key: string }>;
     [Symbol.asyncIterator](): AsyncIterableIterator<TlsConn>;
   }
 
@@ -166,8 +166,16 @@ declare namespace Deno {
      * @deprecated This option is deprecated and will be removed in Deno 2.0.
      */
     keyFile?: string;
-
-    sniInfo?: SniInfo[];
+    /** A function to return a certificate for a connection, based on the name
+     * specified in the TLS ClientHello packet (SNI). If the function throws or
+     * returns a rejected promise, the connection with the client will be aborted.
+     *
+     * The results of this function are cached by name, if the returned
+     * certificate and key are valid. This function will never be invoked in
+     * parallel for the same name.
+     *
+     * Multiple names may return the same certificate and key. */
+    resolveCertificate?(name: string): Promise<{ cert: string; key: string }>;
 
     transport?: "tcp";
 

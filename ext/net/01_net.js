@@ -73,7 +73,10 @@ class Conn {
   #writable;
 
   constructor(rid, remoteAddr, localAddr) {
+    console.log("js: Conn.ctor: ######## net: Conn: ctor: remoteAddr", remoteAddr, "localAddr", localAddr);
+    console.log("js: Conn.ctor: ######## net: Conn: rid", rid);
     this.#rid = rid;
+    console.log("js: Conn.ctor: ######## net: Conn: this.#rid", this.#rid);
     this.#remoteAddr = remoteAddr;
     this.#localAddr = localAddr;
   }
@@ -91,10 +94,12 @@ class Conn {
   }
 
   write(p) {
+    console.log("js: Conn.write: ######## net: Conn: this.rid", this.rid);
     return write(this.rid, p);
   }
 
   async read(buffer) {
+    console.log("js: Conn.read: this.rid", this.rid);
     if (buffer.length === 0) {
       return 0;
     }

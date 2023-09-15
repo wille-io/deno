@@ -10,12 +10,15 @@ function opStartTls(args) {
   return core.opAsync("op_tls_start", args);
 }
 
-function opTlsHandshake(rid) {
-  return core.opAsync("op_tls_handshake", rid);
+async function opTlsHandshake(rid) {
+  console.trace("opTlsHandshake.... rid", rid);
+  let x = await core.opAsync("op_tls_handshake", rid);
+  console.log("opTlsHandshake.... DONE! rid", rid);
+  return x;
 }
 
 class TlsConn extends Conn {
-  handshake() {
+  async handshake() {
     return opTlsHandshake(this.rid);
   }
 }
@@ -33,30 +36,83 @@ async function connectTls({
   if (transport !== "tcp") {
     throw new TypeError(`Unsupported transport: '${transport}'`);
   }
+
+  console.log("js: connectTls: op_net_connect_tls GO");
+  //let x = setInterval(() => console.log("op_net_connect_tls still running..."), 1000);
+
   const { 0: rid, 1: localAddr, 2: remoteAddr } = await core.opAsync(
     "op_net_connect_tls",
     { hostname, port },
     { certFile, caCerts, certChain, privateKey, alpnProtocols },
   );
+
+  //clearInterval(x);
+  console.log("js: connectTls: op_net_connect_tls DONE!");
+
   localAddr.transport = "tcp";
   remoteAddr.transport = "tcp";
-  return new TlsConn(rid, remoteAddr, localAddr);
+  const tlsConn = new TlsConn(rid, remoteAddr, localAddr);
+  
+  // console.trace("js: connectTls: handshake... rid", rid);
+  // await tlsConn.handshake(); // DEADLOCK!
+  // console.trace("js: connectTls: handshake... DONE! rid", rid);
+  
+  return tlsConn;
 }
 
 class TlsListener extends Listener {
-  async accept() {
-    const { 0: rid, 1: localAddr, 2: remoteAddr } = await core.opAsync(
-      "op_net_accept_tls",
-      this.rid,
-    );
-    localAddr.transport = "tcp";
-    remoteAddr.transport = "tcp";
-    return new TlsConn(rid, remoteAddr, localAddr);
+  constructor(rid, localAddr, alpnProtocols, resolveCertificate) {
+    super(rid, localAddr);
+    this.alpnProtocols = alpnProtocols;
+    this.resolveCertificate = resolveCertificate;
   }
 
-  addSniInfo(sniInfo) {
-    ops.op_tls_add_sni_info(this.rid, sniInfo.sni, sniInfo.cert, sniInfo.key);
+  async accept() {
+    // try
+    // {
+    console.log("js: TlsListener.accept: ######## TlsListener: this.rid", this.rid);
+
+    console.log("js: TlsListener.accept: op_net_accept_tls_client_hello_start GO");
+    //let x = setInterval(() => console.log("op_net_accept_tls_client_hello_start still running..."), 1000);
+
+    const { 0: serverName, 1: localAddr, 2: remoteAddr } = await core.opAsync(
+      "op_net_accept_tls_client_hello_start",
+      this.rid,
+    );
+
+    console.log("js: TlsListener.accept: op_net_accept_tls_client_hello_start DONE!");
+    //clearInterval(x);
+
+    console.log("js: TlsListener.accept: ######## TlsListener: serverName", serverName);
+
+    let resolveCertificateCallback = ("resolveCertificate" in this) ? this["resolveCertificate"] : undefined;
+    const { cert, key } = (resolveCertificateCallback && typeof(resolveCertificateCallback) === "function") 
+      ? await resolveCertificateCallback(serverName)
+      : { cert: undefined, key: undefined };
+    
+    console.log("js: TlsListener.accept: op_net_accept_tls_client_hello_end GO");
+    const newRid = ops.op_net_accept_tls_client_hello_end(
+      cert, key, this.rid, this.alpnProtocols, 
+    );
+    console.log("js: TlsListener.accept: op_net_accept_tls_client_hello_end DONE!");
+
+    console.log("js: TlsListener.accept: ######## TlsListener: newRid", newRid, "cert", cert, "key", key);
+
+    localAddr.transport = "tcp";
+    remoteAddr.transport = "tcp";
+    console.log("js: TlsListener.accept: ######## TlsListener: remoteAddr", remoteAddr, "localAddr", localAddr);
+    let tlsConn = new TlsConn(newRid, remoteAddr, localAddr);
+    
+    // console.log("js: TlsListener.accept: handshake...");
+    // await tlsConn.handshake();
+    // console.log("js: TlsListener.accept: handshake... DONE!");
+    
+    console.log("js: TlsListener.accept: returning!");
+    return tlsConn;
+    //}catch(e) { console.log("????", e); return null; } 
   }
+
+  //resolveCertificate(serverName) = null
 }
 
 function listenTls({
@@ -65,7 +121,7 @@ function listenTls({
   certFile,
   key,
   keyFile,
-  sniInfo,
+  resolveCertificate,
   hostname = "0.0.0.0",
   transport = "tcp",
   alpnProtocols = undefined,
@@ -76,9 +132,10 @@ function listenTls({
   }
   const { 0: rid, 1: localAddr } = ops.op_net_listen_tls(
     { hostname, port: Number(port) },
-    { cert, certFile, key, keyFile, sniInfo, alpnProtocols, reusePort },
+    { cert, certFile, key, keyFile, reusePort },
   );
-  return new TlsListener(rid, localAddr);
+  console.log("js: listenTls: ######## listenTls: rid", rid);
+  return new TlsListener(rid, localAddr, alpnProtocols, resolveCertificate);
 }
 
 async function startTls(

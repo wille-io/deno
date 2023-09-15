@@ -24,6 +24,7 @@ Following ops are provided:
 - "op_dns_resolve"
 - "op_net_connect_tls"
 - "op_net_listen_tls"
-- "op_net_accept_tls"
+- "op_net_accept_tls_client_hello_start"
+- "op_net_accept_tls_client_hello_end"
 - "op_tls_start"
 - "op_tls_handshake"

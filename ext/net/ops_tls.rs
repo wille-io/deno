@@ -8,6 +8,9 @@ use crate::resolve_addr::resolve_addr_sync;
 use crate::DefaultTlsOptions;
 use crate::NetPermissions;
 use crate::UnsafelyIgnoreCertificateErrors;
+use deno_tls::rustls::internal::msgs::handshake;
+use deno_tls::rustls::server::Acceptor;
+use deno_tls::rustls::server::Accepted;
 use deno_core::error::bad_resource;
 use deno_core::error::custom_error;
 use deno_core::error::generic_error;
@@ -24,6 +27,7 @@ use deno_core::futures::task::RawWaker;
 use deno_core::futures::task::RawWakerVTable;
 use deno_core::futures::task::Waker;
 use deno_core::op;
+use std::io::Cursor;
 
 use deno_core::parking_lot::Mutex;
 use deno_core::task::spawn;
@@ -39,9 +43,6 @@ use deno_core::ResourceId;
 use deno_tls::create_client_config;
 use deno_tls::load_certs;
 use deno_tls::load_private_keys;
-use deno_tls::rustls::server::ResolvesServerCertUsingSni;
-use deno_tls::rustls::sign::CertifiedKey;
-use deno_tls::rustls::sign::RsaSigningKey;
 use deno_tls::rustls::Certificate;
 use deno_tls::rustls::ClientConfig;
 use deno_tls::rustls::ClientConnection;
@@ -62,10 +63,12 @@ use std::cell::RefCell;
 use std::convert::From;
 use std::convert::TryFrom;
 use std::fs::File;
+use std::fs::read;
 use std::io;
 use std::io::BufReader;
 use std::io::ErrorKind;
 use std::net::SocketAddr;
+use std::net::TcpStream as StdTcpStream;
 use std::path::Path;
 use std::pin::Pin;
 use std::rc::Rc;
@@ -181,6 +184,14 @@ impl TlsStream {
 
   fn get_alpn_protocol(&mut self) -> Option<ByteString> {
     self.inner_mut().tls.alpn_protocol().map(|s| s.into())
+  }
+
+  fn get_server_name(&mut self) -> Option<&str> {
+    if let Connection::Server(conn) = &self.0.as_ref().unwrap().tls {
+      conn.server_name()
+    } else {
+      None
+    }
   }
 }
 
@@ -531,6 +542,10 @@ impl WriteHalf {
   fn get_alpn_protocol(&mut self) -> Option<ByteString> {
     self.shared.get_alpn_protocol()
   }
+
+  fn get_server_name(&mut self) -> Option<String> {
+    self.shared.get_server_name()
+  }
 }
 
 impl AsyncWrite for WriteHalf {
@@ -654,6 +669,15 @@ impl Shared {
     let mut tls_stream = self.tls_stream.lock();
     tls_stream.get_alpn_protocol()
   }
+
+  fn get_server_name(self: &Arc<Self>) -> Option<String> {
+    let mut tls_stream = self.tls_stream.lock();
+    if let Some(server_name) = tls_stream.get_server_name() {
+      Some(server_name.to_string())
+    } else {
+      None
+    }
+  }
 }
 
 struct ImplementReadTrait<'a, T>(&'a mut T);
@@ -690,11 +714,11 @@ pub struct TlsStreamResource {
 }
 
 impl TlsStreamResource {
-  pub fn new((rd, wr): (ReadHalf, WriteHalf)) -> Self {
+  pub fn new((rd, wr): (ReadHalf, WriteHalf), handshake_info: Option<TlsHandshakeInfo>) -> Self {
     Self {
       rd: rd.into(),
       wr: wr.into(),
-      handshake_info: RefCell::new(None),
+      handshake_info: RefCell::new(handshake_info),
       cancel_handle: Default::default(),
     }
   }
@@ -732,15 +756,20 @@ impl TlsStreamResource {
     self: &Rc<Self>,
   ) -> Result<TlsHandshakeInfo, AnyError> {
     if let Some(tls_info) = &*self.handshake_info.borrow() {
+      println!("rust: handshake: >>> hands were already shaken!");
       return Ok(tls_info.clone());
     }
 
+    println!("rust: handshake: >>> doing handshake ...");
     let mut wr = RcRef::map(self, |r| &r.wr).borrow_mut().await;
+    println!("rust: handshake: >>> writer available");
     let cancel_handle = RcRef::map(self, |r| &r.cancel_handle);
     wr.handshake().try_or_cancel(cancel_handle).await?;
+    println!("rust: handshake: >>> doing handshake ... DONE!");
 
     let alpn_protocol = wr.get_alpn_protocol();
-    let tls_info = TlsHandshakeInfo { alpn_protocol };
+    let server_name = wr.get_server_name();
+    let tls_info = TlsHandshakeInfo { alpn_protocol, server_name };
     self.handshake_info.replace(Some(tls_info.clone()));
     Ok(tls_info)
   }
@@ -857,7 +886,7 @@ where
     let mut state_ = state.borrow_mut();
     state_
       .resource_table
-      .add(TlsStreamResource::new(tls_stream.into_split()))
+      .add(TlsStreamResource::new(tls_stream.into_split(), Option::None))
   };
 
   Ok((rid, IpAddr::from(local_addr), IpAddr::from(remote_addr)))
@@ -917,7 +946,15 @@ where
     .await?
     .next()
     .ok_or_else(|| generic_error("No resolved address found"))?;
+
+
+
+  println!("### op_net_connect_tls: before connect");
   let tcp_stream = TcpStream::connect(connect_addr).await?;
+  println!("### op_net_connect_tls: after connect");
+
+
+
   let local_addr = tcp_stream.local_addr()?;
   let remote_addr = tcp_stream.peer_addr()?;
 
@@ -941,6 +978,8 @@ where
     cert_chain_and_key,
   )?;
 
+  tls_config.enable_sni = true;
+
   if let Some(alpn_protocols) = args.alpn_protocols {
     tls_config.alpn_protocols =
       alpn_protocols.into_iter().map(|s| s.into_bytes()).collect();
@@ -951,34 +990,27 @@ where
   let tls_stream =
     TlsStream::new_client_side(tcp_stream, tls_config, hostname_dns);
 
+    //tls_stream.0.unwrap().
+    //tls_stream.inner_mut().
+
   let rid = {
     let mut state_ = state.borrow_mut();
     state_
       .resource_table
-      .add(TlsStreamResource::new(tls_stream.into_split()))
+      .add(TlsStreamResource::new(tls_stream.into_split(), Option::None))
   };
 
   Ok((rid, IpAddr::from(local_addr), IpAddr::from(remote_addr)))
 }
 
-fn load_certs_from_file(path: &str) -> Result<Vec<Certificate>, AnyError> {
-  let cert_file = File::open(path)?;
-  let reader = &mut BufReader::new(cert_file);
-  load_certs(reader)
-}
-
-fn load_private_keys_from_file(
-  path: &str,
-) -> Result<Vec<PrivateKey>, AnyError> {
-  let key_bytes = std::fs::read(path)?;
-  load_private_keys(&key_bytes)
-}
-
 pub struct TlsListenerResource {
   pub(crate) tcp_listener: AsyncRefCell<TcpListener>,
-  pub(crate) tls_config: AsyncRefCell<ServerConfig>,
+  tcp_stream: AsyncRefCell<Option<TcpStream>>, // TODO: cleanup?
+  pub(crate) tls_config: AsyncRefCell<Option<ServerConfig>>,
   cancel_handle: CancelHandle,
-  sni_info: AsyncRefCell<Vec<SniInfo>>,
+  accepted: AsyncRefCell<Option<Accepted>>, // TODO: cleanup?
+  cert_chain: AsyncRefCell<Option<Vec<Certificate>>>,
+  key_der: AsyncRefCell<Option<PrivateKey>>,
 }
 
 impl Resource for TlsListenerResource {
@@ -991,14 +1023,6 @@ impl Resource for TlsListenerResource {
   }
 }
 
-#[derive(Deserialize, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct SniInfo {
-  sni: String,
-  cert: String,
-  key: String,
-}
-
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ListenTlsArgs {
@@ -1008,29 +1032,16 @@ pub struct ListenTlsArgs {
   key: Option<String>,
   // TODO(kt3k): Remove this option at v2.0.
   key_file: Option<String>,
-  sni_info: Option<Vec<SniInfo>>,
-  alpn_protocols: Option<Vec<String>>,
+  //alpn_protocols: Option<Vec<String>>,
   reuse_port: bool,
 }
 
-fn build_resolver(
-  sni_info: &[SniInfo],
-) -> Result<ResolvesServerCertUsingSni, AnyError> {
-  let mut resolver = ResolvesServerCertUsingSni::new();
+fn cert_and_key_from_string(cert: &String, key: &String) -> Result<(Vec<Certificate>, PrivateKey), AnyError>
+{
+  let cert_chain = load_certs(&mut BufReader::new(cert.as_bytes()))?; // load_certs(reader.as_mut());
+  let key_der = load_private_keys(&key.as_bytes())?.remove(0);
 
-  for elem in sni_info.iter() {
-    let certs: Vec<Certificate> =
-      load_certs(&mut BufReader::new(elem.cert.as_bytes()))?;
-    let key = load_private_keys(elem.key.as_bytes())?.remove(0);
-    let signing_key = RsaSigningKey::new(&key)?;
-
-    resolver.add(
-      elem.sni.as_str(),
-      CertifiedKey::new(certs, Arc::new(signing_key)),
-    )?;
-  }
-
-  Ok(resolver)
+  Ok((cert_chain, key_der))
 }
 
 #[op]
@@ -1050,7 +1061,6 @@ where
   let key_file = args.key_file.as_deref();
   let cert = args.cert.as_deref();
   let key = args.key.as_deref();
-  let sni_info = args.sni_info.as_deref();
 
   {
     let permissions = state.borrow_mut::<NP>();
@@ -1064,73 +1074,27 @@ where
     }
   }
 
-  let tls_config_builder = ServerConfig::builder()
-    .with_safe_defaults()
-    .with_no_client_auth();
-  let mut tls_config: ServerConfig;
-
-  if let Some(vec) = sni_info {
-    if cert_file.is_some() || key_file.is_some() {
-      return Err(generic_error(
-        "If `sniInfo` is specified, `cert` and `key` cannot be specified, too.",
-      ));
-    } else if cert.is_some() || key.is_some() {
-      return Err(generic_error("If `sniInfo` is specified, `certFile` and `keyFile` cannot be specified, too."));
-    }
-
-    tls_config =
-      tls_config_builder.with_cert_resolver(Arc::new(build_resolver(vec)?));
-  } else {
-    let cert_chain;
-    let key_der;
-
-    // TODO: re-rust this - like it was before
+  let (cert_chain, key_der) = {
     if cert_file.is_some() {
       if key_file.is_none() {
-        return Err(generic_error(
-          "If `certFile` is specified, `keyFile` needs to be specified, too.",
-        ));
+        return Err(generic_error("If `certFile` is specified, `keyFile` needs to be specified, too."));
       } else if cert.is_some() || key.is_some() {
         return Err(generic_error("If `certFile` and `keyFile` are specified, `cert` and `key` cannot be specified, too."));
-      } else if sni_info.is_some() {
-        return Err(generic_error("If `certFile` and `keyFile` are specified, `sniInfo` cannot be specified, too."));
       }
 
-      cert_chain = load_certs_from_file(cert_file.unwrap())?;
-      key_der =
-        load_private_keys_from_file(key_file.unwrap())?.remove(0);
+      (Some(load_certs(&mut BufReader::new(File::open(cert_file.unwrap())?))?), Some(load_private_keys(&read(key_file.unwrap())?)?.remove(0)))
     } else if cert.is_some() {
       if key.is_none() {
-        return Err(generic_error(
-          "If `cert` is specified, `key` needs to be specified, too.",
-        ));
+        return Err(generic_error("If `cert` is specified, `key` needs to be specified, too."));
       } else if cert_file.is_some() || key_file.is_some() {
         return Err(generic_error("If `cert` and `key` are specified, `certFile` and `keyFile` cannot be specified, too."));
-      } else if sni_info.is_some() {
-        return Err(generic_error("If `cert` and `key` are specified, `sniInfo` cannot be specified, too."));
       }
 
-      cert_chain =
-        load_certs(&mut BufReader::new(cert.unwrap().as_bytes()))?;
-      key_der = load_private_keys(key.unwrap().as_bytes())?.remove(0);
+      (Some(load_certs(&mut BufReader::new(cert.unwrap().to_string().as_bytes()))?), Some(load_private_keys(&key.unwrap().to_string().as_bytes())?.remove(0)))
     } else {
-      return Err(generic_error("Specify either `cert` with `key` or `certFile` with `keyFile` or `sniInfo`."));
-    };
-
-    tls_config = tls_config_builder
-      .with_single_cert(cert_chain, key_der)
-      .map_err(|e| {
-        custom_error(
-          "InvalidData",
-          format!("Error creating TLS certificate: {:?}", e),
-        )
-      })?;
-  }
-
-  if let Some(alpn_protocols) = args.alpn_protocols {
-    tls_config.alpn_protocols =
-      alpn_protocols.into_iter().map(|s| s.into_bytes()).collect();
-  }
+      (Option::None, Option::None)
+    }
+  };
 
   let bind_addr = resolve_addr_sync(&addr.hostname, addr.port)?
     .next()
@@ -1140,6 +1104,7 @@ where
   } else {
     Domain::IPV6
   };
+
   let socket = Socket::new(domain, Type::STREAM, None)?;
   #[cfg(not(windows))]
   socket.set_reuse_address(true)?;
@@ -1147,6 +1112,7 @@ where
     #[cfg(target_os = "linux")]
     socket.set_reuse_port(true)?;
   }
+
   let socket_addr = socket2::SockAddr::from(bind_addr);
   socket.bind(&socket_addr)?;
   socket.listen(128)?;
@@ -1154,12 +1120,15 @@ where
   let std_listener: std::net::TcpListener = socket.into();
   let tcp_listener = TcpListener::from_std(std_listener)?;
   let local_addr = tcp_listener.local_addr()?;
-
+  
   let tls_listener_resource = TlsListenerResource {
     tcp_listener: AsyncRefCell::new(tcp_listener),
-    tls_config: AsyncRefCell::new(tls_config),
+    tcp_stream: AsyncRefCell::new(Option::None),
+    tls_config: AsyncRefCell::new(Option::None),
     cancel_handle: Default::default(),
-    sni_info: AsyncRefCell::new(sni_info.map_or(Vec::new(), |s| s.to_vec())),
+    accepted: AsyncRefCell::new(Option::None),
+    cert_chain: AsyncRefCell::new(cert_chain),
+    key_der: AsyncRefCell::new(key_der),
   };
 
   let rid = state.resource_table.add(tls_listener_resource);
@@ -1168,53 +1137,17 @@ where
 }
 
 #[op]
-pub fn op_tls_add_sni_info(
+pub async fn op_net_accept_tls_client_hello_start(
   state: Rc<RefCell<OpState>>,
   rid: ResourceId,
-  sni: String,
-  cert: String,
-  key: String,
-) -> Result<(), AnyError> {
+) -> Result<(String, IpAddr, IpAddr), AnyError> {
+  let mut x = 0;
+
   let resource = state
-    .borrow()
+    .borrow_mut()
     .resource_table
     .get::<TlsListenerResource>(rid)
-    .map_err(|_| bad_resource("Listener has been closed"))?;
-
-  let mut sni_info_ref = RcRef::map(&resource, |r| &r.sni_info)
-    .try_borrow_mut() // TODO: await?
-    .ok_or_else(|| custom_error("Busy", "sni_info busy"))?; // TODO: msg...???
-
-  // tls_config was initialized with a single certificate - to make addSniInfo always work,
-  // tls_config has to always be initialized with a cert resolver, which (might) (slightly) reduce
-  // performance and (might) (slightly) increase memory usage
-  // Prevent adding sniInfo if tls_config was not initialized with sniInfo / a cert resolver
-  if sni_info_ref.is_empty() {
-    return Err(generic_error("Unable to call `addSniInfo` if the listener was not initialized with `sniInfo`"));
-  }
-
-  sni_info_ref.push(SniInfo { sni, cert, key, });
-
-  let mut tls_config_ref = RcRef::map(&resource, |r| &r.tls_config)
-    .try_borrow_mut() // TODO: await?
-    .ok_or_else(|| custom_error("Busy", "tls_config busy"))?; // TODO: msg...???
-
-  tls_config_ref.cert_resolver =
-    Arc::new(build_resolver(&sni_info_ref).unwrap());
-
-  Ok(())
-}
-
-#[op]
-pub async fn op_net_accept_tls(
-  state: Rc<RefCell<OpState>>,
-  rid: ResourceId,
-) -> Result<(ResourceId, IpAddr, IpAddr), AnyError> {
-  let resource = state
-    .borrow()
-    .resource_table
-    .get::<TlsListenerResource>(rid)
-    .map_err(|_| bad_resource("Listener has been closed"))?;
+    .map_err(|_| custom_error("","Listener has been closed"))?;
 
   let cancel_handle = RcRef::map(&resource, |r| &r.cancel_handle);
   let tcp_listener = RcRef::map(&resource, |r| &r.tcp_listener)
@@ -1226,28 +1159,233 @@ pub async fn op_net_accept_tls(
       Ok(tuple) => tuple,
       Err(err) if err.kind() == ErrorKind::Interrupted => {
         // FIXME(bartlomieju): compatibility with current JS implementation.
-        return Err(bad_resource("Listener has been closed"));
+        return Err(custom_error("","xxxxxxxxx Listener has been closed"));
       }
       Err(err) => return Err(err.into()),
     };
 
   let local_addr = tcp_stream.local_addr()?;
+  //let mut tcp_stream_std = tcp_stream.into_std()?;
+  // tcp_stream_std.set_nonblocking(false)?;
 
-  let tls_config = RcRef::map(&resource, |r| &r.tls_config)
+  //let (r, mut w) = tcp_stream.split();
+  //let mut stream_ref: &mut TcpStream = &mut tcp_stream;
+
+  // TODO: move sni & alpn check stuff into handshake op??? 
+  
+  // handshake!:
+  x+=1; println!("### {:?}", x);
+  
+  let mut acceptor = Acceptor::default();
+  let mut x2;
+
+  let mut check = false;
+  
+  let _accepted = loop {
+    x2 = 0;
+
+    if check {
+      x2+=1; println!("##### accept loop #{:?} - waiting for readable...", x2);
+
+      tcp_stream.readable().try_or_cancel(&cancel_handle).await?;
+      check = false;
+
+      x2+=1; println!("##### accept loop #{:?} - readable returned!", x2);
+    } else {
+      x2+=1; println!("##### accept loop #{:?} - not checking for readable", x2);
+    }
+
+
+    let mut msg = vec![0; 10*1024];
+
+    let try_read_res = tcp_stream.try_read(&mut msg); // non-blocking
+    let size = {
+      match try_read_res {
+        Ok(0) => {
+          x2+=1; println!("####### SIZE < 1 ! accept loop #{:?}", x2);
+          check = true;
+          continue; //break Err(generic_error("xxx1"));
+        }
+
+        Ok(n) => {
+          x2+=1; println!("####### READ {:?} bytes ! accept loop #{:?}", n, x2);
+          n
+        }
+
+        Err(err) => {
+          x2+=1; println!("####### STOP ({:?}) ! accept loop #{:?}", err, x2);
+          check = true;
+          continue; //break Err(generic_error("xxx2"));
+        }
+      }
+    };
+
+    x2+=1; println!("##### accept loop #{:?}", x2);
+
+    msg.truncate(size);
+
+    let mut cursor = Cursor::new(msg);
+
+    x2+=1; println!("##### accept loop #{:?}", x2);
+
+    acceptor.read_tls(&mut cursor)?;
+
+    x2+=1; println!("##### accept loop #{:?}", x2);
+
+    if let Some(accepted) = acceptor.accept()? {
+      x2+=1; println!("##### ACCEPTED! at loop #{:?}", x2);
+      break 
+        //Ok(accepted);
+        accepted;
+    }
+  };
+
+  x+=1; println!("### {:?}", x);
+
+  // if _accepted.is_err() {
+  //   println!("### !!! ACCEPTED IS ERROR! {:?}", _accepted.as_ref().err());
+  // }
+
+  let accepted = 
+    //_accepted?;
+    _accepted;
+
+  x+=1; println!("### {:?} ########", x);
+  
+  let mut tcp_stream_res = RcRef::map(&resource, |r| &r.tcp_stream)
     .try_borrow_mut()
-    .ok_or_else(|| custom_error("Busy", "Another accept task is ongoing"))?; // TODO: ...???
+    .ok_or_else(|| custom_error("Busy", "Another accept task is ongoing"))?;
+  *tcp_stream_res = Some(tcp_stream);
 
-  let tls_stream =
-    TlsStream::new_server_side(tcp_stream, Arc::new(tls_config.clone()));
+  x+=1; println!("### {:?}", x);
+  
+  let server_name = accepted.client_hello().server_name().unwrap_or("").to_string();
 
-  let rid = {
+  x+=1; println!("### {:?}", x);
+
+  let mut res_accepted = RcRef::map(&resource, |r| &r.accepted)
+    .try_borrow_mut()
+    .ok_or_else(|| custom_error("Busy", "Another accept task is ongoing"))?
+    ; // TODO: ...???
+
+  x+=1; println!("### {:?}", x);
+
+  *res_accepted = Some(accepted);
+
+  Ok((server_name, IpAddr::from(local_addr), IpAddr::from(remote_addr)))
+}
+
+#[op]
+pub fn op_net_accept_tls_client_hello_end(
+  state: Rc<RefCell<OpState>>,
+  cert: Option<String>,
+  key: Option<String>,
+  rid: ResourceId,
+  alpn_protocols: Option<Vec<String>>,
+) -> Result<ResourceId, AnyError> {
+  let resource = state
+    .borrow_mut()
+    .resource_table
+    .get::<TlsListenerResource>(rid)
+    .map_err(|_| custom_error("Busy","xxListener has been closed"))?;
+
+  // TODO: cache decoded certs & keys instead of always decoding them after every call to `resolveCertificate`??
+
+  let cert_chain = RcRef::map(&resource, |r| &r.cert_chain)
+    .try_borrow()
+    .ok_or_else(|| custom_error("Busy", "Another accept task is ongoing"))?
+    ; // TODO: ...???
+
+  let key_der = RcRef::map(&resource, |r| &r.key_der)
+    .try_borrow()
+    .ok_or_else(|| custom_error("Busy", "Another accept task is ongoing"))?
+    ; // TODO: ...???
+
+  let tls_config_builder = ServerConfig::builder()
+    .with_safe_defaults()
+    .with_no_client_auth();
+
+  let tls_config_result = {
+    if cert.is_some() && key.is_some() {
+      let (xcert, xkey) = cert_and_key_from_string(&cert.unwrap(), &key.unwrap())?;
+      tls_config_builder.with_single_cert(xcert, xkey)
+    } else if cert_chain.is_some() && key_der.is_some() {
+      tls_config_builder.with_single_cert(cert_chain.as_ref().clone().unwrap(), key_der.as_ref().clone().unwrap())
+    } else {
+      // TODO: close listener?
+      return Err(generic_error("No certs available."));
+    }
+  };
+
+  let mut tls_config = tls_config_result
+    .map_err(|e| {
+    custom_error(
+      "InvalidData",
+      format!("Error creating TLS certificate: {:?}", e),
+    )
+  })?;
+
+  if let Some(alpn_protocols) = alpn_protocols {
+    tls_config.alpn_protocols =
+      alpn_protocols.into_iter().map(|s| s.into_bytes()).collect();
+  }
+
+  let mut accepted = RcRef::map(&resource, |r| &r.accepted)
+    .try_borrow_mut()
+    .ok_or_else(|| custom_error("Busy", "Another accept task is ongoing"))?
+    ; // TODO: ...???
+
+  let _accepted = accepted.take().unwrap();
+
+  let handshake_info = Some(TlsHandshakeInfo { 
+    alpn_protocol: 
+      if let Some(alpn_protocol) = _accepted.client_hello().alpn() {
+        let mut alpn_data: Vec<u8> = Vec::new();
+        for alpn in alpn_protocol {
+          alpn_data.append(&mut alpn.to_vec());
+        }
+        Some(alpn_data.into())
+      } else {
+        Option::None
+      },
+    server_name: 
+      if let Some(server_name) = _accepted.client_hello().server_name() {
+        Some(server_name.to_string())
+      } else {
+        None
+      }
+    }
+  );
+
+  let server_connection = _accepted.into_connection(Arc::new(tls_config.clone()))?;
+
+  let mut tcp_stream = RcRef::map(&resource, |r| &r.tcp_stream)
+    .try_borrow_mut()
+    .ok_or_else(|| custom_error("Busy", "Another accept task is ongoing"))?
+    ; // TODO: ...???
+
+  let tls_stream = {
+    if let Some(tcp_stream) = tcp_stream.take() {
+      TlsStream::new_server_side_from(tcp_stream, server_connection)
+    } else {
+      return Err(custom_error("TODO: ?!?!!?", "?!?!?!"));
+    }
+  };
+
+  let mut tls_config_res = RcRef::map(&resource, |r| &r.tls_config)
+    .try_borrow_mut()
+    .ok_or_else(|| custom_error("Busy", "Another accept task is ongoing"))?
+    ; // TODO: ...???
+  *tls_config_res = Some(tls_config);
+
+  let new_rid = {
     let mut state_ = state.borrow_mut();
     state_
       .resource_table
-      .add(TlsStreamResource::new(tls_stream.into_split()))
+      .add(TlsStreamResource::new(tls_stream.into_split(), handshake_info))
   };
 
-  Ok((rid, IpAddr::from(local_addr), IpAddr::from(remote_addr)))
+  Ok(new_rid)
 }
 
 #[op]
@@ -1259,5 +1397,8 @@ pub async fn op_tls_handshake(
     .borrow()
     .resource_table
     .get::<TlsStreamResource>(rid)?;
-  resource.handshake().await
+  println!("rust: op_tls_handshake: handshaking...");
+  let res = resource.handshake().await;
+  println!("rust: op_tls_handshake: handshaking... DONE!");
+  res
 }
