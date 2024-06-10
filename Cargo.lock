@@ -5479,8 +5479,7 @@ dependencies = [
 [[package]]
 name = "rustls-tokio-stream"
 version = "0.2.24"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fd707225bb670bcd2876886bb571753d1ce03a9cedfa2e629a79984ca9a93cfb"
+source = "git+https://github.com/wille-io/rustls-tokio-stream?branch=cancel-accept-on-client-disconnect#c4ddac716b6a2211c0883f991729b83e5e8aee08"
 dependencies = [
  "futures",
  "rustls",
